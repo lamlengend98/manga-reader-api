@@ -142,17 +142,32 @@ async function axiosFetch(targetUrl) {
     return null;
 }
 
-// ── fetchHTML chính: axios trước, FlareSolverr sau — có request dedup ──
+const CF_WORKER_URL = process.env.CF_WORKER_URL;
+
+// ── fetchHTML chính: axios trước, CF Worker proxy, FlareSolverr sau — có request dedup ──
 async function fetchHTML(targetUrl) {
     const existing = inflightRequests.get(targetUrl);
     if (existing) return existing;
 
     const promise = (async () => {
-        // 1. Fast path: axios trực tiếp với browser TLS + mirror fallback
+        // 1. Fast path: axios trực tiếp
         const fast = await axiosFetch(targetUrl);
         if (fast) return fast;
 
-        // 2. Slow path: FlareSolverr nếu có
+        // 2. Cloudflare Worker Proxy (nếu có cấu hình CF_WORKER_URL)
+        if (CF_WORKER_URL) {
+            try {
+                const proxyEndpoint = `${CF_WORKER_URL.replace(/\/$/, '')}/?url=${encodeURIComponent(targetUrl)}`;
+                const workerRes = await axios.get(proxyEndpoint, { timeout: 15000 });
+                if (workerRes.status === 200 && workerRes.data) {
+                    return workerRes.data;
+                }
+            } catch (err) {
+                console.warn('[cf-worker] proxy fetch failed:', err.message);
+            }
+        }
+
+        // 3. Slow path: FlareSolverr nếu có
         try {
             console.log('[flare] trying FlareSolverr for:', targetUrl);
             return await flareFetch(targetUrl);
