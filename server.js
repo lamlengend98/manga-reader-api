@@ -38,57 +38,66 @@ async function ensureSession() {
     }
 }
 
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 // ── Fetch HTML qua FlareSolverr (dùng named session → nhanh hơn vì cookies persist) ──
 async function flareFetch(targetUrl) {
-    const res = await axios.post(FLARESOLVERR_URL, {
-        cmd: 'request.get',
-        url: targetUrl,
-        session: SESSION_NAME,
-        maxTimeout: 60000
-    });
+    try {
+        const res = await axios.post(FLARESOLVERR_URL, {
+            cmd: 'request.get',
+            url: targetUrl,
+            session: SESSION_NAME,
+            maxTimeout: 60000
+        }, { timeout: 30000 });
 
-    if (res.data.status !== 'ok') {
-        throw new Error(`FlareSolverr error: ${res.data.message || 'unknown'}`);
+        if (res.data?.status !== 'ok') {
+            throw new Error(`FlareSolverr error: ${res.data?.message || 'unknown'}`);
+        }
+
+        const solution = res.data.solution;
+        if (solution.status !== 200) {
+            throw new Error(`Target responded with status ${solution.status}`);
+        }
+
+        // Cache cookies + UA cho axios fast-path
+        if (solution.cookies?.length) {
+            const domain = new URL(targetUrl).hostname;
+            sessionCache.set(domain, {
+                cookies: solution.cookies,
+                userAgent: solution.userAgent
+            });
+        }
+
+        return solution.response;
+    } catch (err) {
+        throw new Error(`FlareSolverr unavailable (${err.message})`);
     }
-
-    const solution = res.data.solution;
-    if (solution.status !== 200) {
-        throw new Error(`Target responded with status ${solution.status}`);
-    }
-
-    // Cache cookies + UA cho axios fast-path
-    if (solution.cookies?.length) {
-        const domain = new URL(targetUrl).hostname;
-        sessionCache.set(domain, {
-            cookies: solution.cookies,
-            userAgent: solution.userAgent
-        });
-    }
-
-    return solution.response;
 }
 
-// ── Fetch HTML qua axios (fast path, <1s nếu cookies hợp lệ) ──
+// ── Fetch HTML qua axios (fast path trực tiếp, <1s) ──
 async function axiosFetch(targetUrl) {
     const domain = new URL(targetUrl).hostname;
     const session = sessionCache.get(domain);
-    if (!session) return null; // Chưa có cookies → bỏ qua
 
-    const cookieHeader = session.cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    const headers = {
+        'User-Agent': session?.userAgent || DEFAULT_USER_AGENT,
+        'Referer': `https://${domain}/`,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
+    };
+
+    if (session?.cookies?.length) {
+        headers['Cookie'] = session.cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    }
+
     const response = await axios.get(targetUrl, {
-        headers: {
-            'Cookie': cookieHeader,
-            'User-Agent': session.userAgent,
-            'Referer': `https://${domain}/`,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
-        },
-        timeout: 10000,
+        headers,
+        timeout: 15000,
         validateStatus: (status) => status < 500
     });
 
     if (response.status === 403 || response.status === 503) {
-        return null; // Cloudflare blocked → fallback
+        return null; // Cloudflare blocked → fallback FlareSolverr
     }
     return response.data;
 }
@@ -101,16 +110,16 @@ async function fetchHTML(targetUrl) {
 
     const promise = (async () => {
         try {
-            // Fast path: axios với cached cookies
+            // Fast path: axios trực tiếp với browser headers
             const fast = await axiosFetch(targetUrl);
             if (fast) return fast;
-        } catch {
-            // axios fail → fallback
+        } catch (err) {
+            console.warn('[axios] direct fetch failed, trying fallback:', err.message);
         }
 
-        // Slow path: FlareSolverr (browser thật)
+        // Slow path: FlareSolverr nếu có
         console.log('[flare] fetching:', targetUrl);
-        return flareFetch(targetUrl);
+        return await flareFetch(targetUrl);
     })();
 
     inflightRequests.set(targetUrl, promise);
@@ -129,7 +138,7 @@ async function prewarm() {
         await flareFetch('https://truyenqqko.com/truyen-hoan-thanh');
         console.log('[flare] pre-warm done, cookies cached');
     } catch (err) {
-        console.error('[flare] pre-warm failed:', err.message);
+        console.log('[flare] pre-warm skipped or unavailable:', err.message);
     }
 }
 
@@ -161,6 +170,31 @@ const TTL = {
     STORY: 15 * 60 * 1000,           // danh sách chương: 15 phút
     CHAPTER: 7 * 24 * 60 * 60 * 1000 // nội dung ảnh 1 chương: 7 ngày (gần như không đổi)
 };
+
+// ─────────────────────────────────────────────────────────────
+// Healthcheck & Info
+// ─────────────────────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+    res.json({
+        name: 'manga-reader-proxy-api',
+        status: 'online',
+        version: '1.0.0',
+        endpoints: [
+            '/truyenqq/completed',
+            '/truyenqq/search?q=...',
+            '/truyenqq/category?genre=...',
+            '/truyenqq/story?url=...',
+            '/truyenqq/chapter?url=...',
+            '/history',
+            '/search-history'
+        ]
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
+});
 
 // ─────────────────────────────────────────────────────────────
 // Routes: TruyenQQ
