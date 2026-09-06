@@ -209,7 +209,9 @@ async function cachedFetch(cacheKey, ttlMs, fetchFn) {
         return cached.data;
     }
     const data = await fetchFn();
-    responseCache.set(cacheKey, { data, expiresAt: Date.now() + ttlMs });
+    if (data && (!Array.isArray(data.stories) || data.stories.length > 0)) {
+        responseCache.set(cacheKey, { data, expiresAt: Date.now() + ttlMs });
+    }
     return data;
 }
 
