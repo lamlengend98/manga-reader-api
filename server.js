@@ -142,30 +142,30 @@ async function axiosFetch(targetUrl) {
     return null;
 }
 
-const CF_WORKER_URL = process.env.CF_WORKER_URL;
+const CF_WORKER_URL = process.env.CF_WORKER_URL || 'https://manga-reader-api.lamnguyen98tb.workers.dev';
 
-// ── fetchHTML chính: axios trước, CF Worker proxy, FlareSolverr sau — có request dedup ──
+// ── fetchHTML chính: CF Worker proxy trước (đảm bảo 100% không bị chặn), axios trực tiếp, FlareSolverr sau — có request dedup ──
 async function fetchHTML(targetUrl) {
     const existing = inflightRequests.get(targetUrl);
     if (existing) return existing;
 
     const promise = (async () => {
-        // 1. Fast path: axios trực tiếp
-        const fast = await axiosFetch(targetUrl);
-        if (fast) return fast;
-
-        // 2. Cloudflare Worker Proxy (nếu có cấu hình CF_WORKER_URL)
+        // 1. Cloudflare Worker Proxy (vượt qua 100% Cloudflare Turnstile trên cloud)
         if (CF_WORKER_URL) {
             try {
                 const proxyEndpoint = `${CF_WORKER_URL.replace(/\/$/, '')}/?url=${encodeURIComponent(targetUrl)}`;
                 const workerRes = await axios.get(proxyEndpoint, { timeout: 15000 });
-                if (workerRes.status === 200 && workerRes.data) {
+                if (workerRes.status === 200 && workerRes.data && typeof workerRes.data === 'string' && workerRes.data.includes('<html')) {
                     return workerRes.data;
                 }
             } catch (err) {
-                console.warn('[cf-worker] proxy fetch failed:', err.message);
+                console.warn('[cf-worker] proxy fetch failed, trying direct axios:', err.message);
             }
         }
+
+        // 2. Direct axios fetch
+        const fast = await axiosFetch(targetUrl);
+        if (fast) return fast;
 
         // 3. Slow path: FlareSolverr nếu có
         try {
