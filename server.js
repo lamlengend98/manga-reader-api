@@ -8,14 +8,29 @@ import { searchHistoryStore } from './searchHistoryStore.js';
 const app = express();
 app.use(express.json());
 
-// ── HTTP Keep-Alive: tái sử dụng kết nối TCP/TLS cho các request liên tiếp ──
-const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 20 });
+// ── HTTP Keep-Alive & Chrome TLS Ciphers ──
+const keepAliveAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 20,
+    ciphers: [
+        'TLS_AES_128_GCM_SHA256',
+        'TLS_AES_256_GCM_SHA384',
+        'TLS_CHACHA20_POLY1305_SHA256',
+        'ECDHE-ECDSA-AES128-GCM-SHA256',
+        'ECDHE-RSA-AES128-GCM-SHA256',
+        'ECDHE-ECDSA-AES256-GCM-SHA384',
+        'ECDHE-RSA-AES256-GCM-SHA384'
+    ].join(':'),
+    honorCipherOrder: true,
+    minVersion: 'TLSv1.2',
+    maxVersion: 'TLSv1.3'
+});
 axios.defaults.httpsAgent = keepAliveAgent;
 
 // ─────────────────────────────────────────────────────────────
 // Cloudflare bypass — Hybrid: axios fast-path + FlareSolverr fallback
 // ─────────────────────────────────────────────────────────────
-const FLARESOLVERR_URL = 'http://localhost:8191/v1';
+const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || 'http://localhost:8191/v1';
 const SESSION_NAME = 'manga_reader';
 
 // Cookie + UA cache per domain — populated from FlareSolverr responses
@@ -27,20 +42,19 @@ const inflightRequests = new Map(); // url -> Promise<html>
 // ── Quản lý FlareSolverr named session ──
 async function ensureSession() {
     try {
-        // Tạo session mới (nếu đã tồn tại thì FlareSolverr trả về lỗi nhẹ, bỏ qua)
         await axios.post(FLARESOLVERR_URL, {
             cmd: 'sessions.create',
             session: SESSION_NAME
-        });
+        }, { timeout: 3000 });
         console.log('[flare] session created:', SESSION_NAME);
     } catch {
-        // Session đã tồn tại — OK
+        // Session đã tồn tại hoặc FlareSolverr không khả dụng — bỏ qua
     }
 }
 
-const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-// ── Fetch HTML qua FlareSolverr (dùng named session → nhanh hơn vì cookies persist) ──
+// ── Fetch HTML qua FlareSolverr (nếu có cài đặt) ──
 async function flareFetch(targetUrl) {
     try {
         const res = await axios.post(FLARESOLVERR_URL, {
@@ -48,7 +62,7 @@ async function flareFetch(targetUrl) {
             url: targetUrl,
             session: SESSION_NAME,
             maxTimeout: 60000
-        }, { timeout: 30000 });
+        }, { timeout: 15000 });
 
         if (res.data?.status !== 'ok') {
             throw new Error(`FlareSolverr error: ${res.data?.message || 'unknown'}`);
@@ -74,52 +88,79 @@ async function flareFetch(targetUrl) {
     }
 }
 
-// ── Fetch HTML qua axios (fast path trực tiếp, <1s) ──
+// ── Fetch HTML qua axios (fast path trực tiếp + mirror fallback) ──
 async function axiosFetch(targetUrl) {
-    const domain = new URL(targetUrl).hostname;
+    const urlObj = new URL(targetUrl);
+    const domain = urlObj.hostname;
     const session = sessionCache.get(domain);
 
     const headers = {
         'User-Agent': session?.userAgent || DEFAULT_USER_AGENT,
         'Referer': `https://${domain}/`,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Sec-Ch-Ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
     };
 
     if (session?.cookies?.length) {
         headers['Cookie'] = session.cookies.map(c => `${c.name}=${c.value}`).join('; ');
     }
 
-    const response = await axios.get(targetUrl, {
-        headers,
-        timeout: 15000,
-        validateStatus: (status) => status < 500
-    });
-
-    if (response.status === 403 || response.status === 503) {
-        return null; // Cloudflare blocked → fallback FlareSolverr
+    // Danh sách domain mirror nếu domain chính bị Cloudflare chặn trên IP datacenter
+    const candidateUrls = [targetUrl];
+    if (domain === 'truyenqqko.com') {
+        candidateUrls.push(targetUrl.replace('truyenqqko.com', 'truyenqqto.com'));
+        candidateUrls.push(targetUrl.replace('truyenqqko.com', 'truyenqqhot.com'));
     }
-    return response.data;
+
+    for (const url of candidateUrls) {
+        try {
+            const response = await axios.get(url, {
+                headers: {
+                    ...headers,
+                    'Referer': `https://${new URL(url).hostname}/`
+                },
+                timeout: 10000,
+                validateStatus: (status) => status < 500
+            });
+
+            if (response.status === 200 && response.data) {
+                return response.data;
+            }
+        } catch (err) {
+            console.warn(`[axios] fetch ${url} error:`, err.message);
+        }
+    }
+
+    return null;
 }
 
 // ── fetchHTML chính: axios trước, FlareSolverr sau — có request dedup ──
 async function fetchHTML(targetUrl) {
-    // Dedup: nếu đang có request cùng URL, chờ nó xong
     const existing = inflightRequests.get(targetUrl);
     if (existing) return existing;
 
     const promise = (async () => {
+        // 1. Fast path: axios trực tiếp với browser TLS + mirror fallback
+        const fast = await axiosFetch(targetUrl);
+        if (fast) return fast;
+
+        // 2. Slow path: FlareSolverr nếu có
         try {
-            // Fast path: axios trực tiếp với browser headers
-            const fast = await axiosFetch(targetUrl);
-            if (fast) return fast;
+            console.log('[flare] trying FlareSolverr for:', targetUrl);
+            return await flareFetch(targetUrl);
         } catch (err) {
-            console.warn('[axios] direct fetch failed, trying fallback:', err.message);
+            console.warn('[flare] fallback failed:', err.message);
         }
 
-        // Slow path: FlareSolverr nếu có
-        console.log('[flare] fetching:', targetUrl);
-        return await flareFetch(targetUrl);
+        throw new Error(`Không thể tải dữ liệu từ trang nguồn (${targetUrl})`);
     })();
 
     inflightRequests.set(targetUrl, promise);
@@ -190,6 +231,29 @@ app.get('/', (req, res) => {
             '/search-history'
         ]
     });
+});
+
+app.get('/debug/test-fetch', async (req, res) => {
+    try {
+        const testUrl = req.query.url || 'https://truyenqqko.com/truyen-hoan-thanh';
+        const response = await axios.get(testUrl, {
+            headers: {
+                'User-Agent': DEFAULT_USER_AGENT,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
+            },
+            timeout: 15000,
+            validateStatus: () => true
+        });
+        res.json({
+            url: testUrl,
+            status: response.status,
+            headers: response.headers,
+            dataPreview: typeof response.data === 'string' ? response.data.slice(0, 500) : response.data
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message, stack: err.stack });
+    }
 });
 
 app.get('/health', (req, res) => {
