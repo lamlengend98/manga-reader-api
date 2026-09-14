@@ -180,9 +180,51 @@ export default {
 
                 const cacheKey = `truyenqq:search:${query.toLowerCase()}:${page}`;
                 const result = await cachedFetch(cacheKey, TTL.LISTING, async () => {
-                    const searchUrl = truyenqq.searchUrl(query, page);
-                    const html = await fetchHTML(searchUrl);
-                    return truyenqq.parseSearch(html, page);
+                    const normQ = normalizeText(query);
+
+                    // Strategy 1: Try direct search endpoint
+                    try {
+                        const searchUrl = truyenqq.searchUrl(query, page);
+                        const html = await fetchHTML(searchUrl);
+                        const parsed = truyenqq.parseSearch(html, page);
+                        if (parsed.stories && parsed.stories.length > 0) {
+                            return parsed;
+                        }
+                    } catch (e) {
+                        // ignore and try fallback
+                    }
+
+                    // Strategy 2: Aggregate top listings (recent, hot, completed) and filter by keyword
+                    try {
+                        const urls = [
+                            'https://truyenqqko.com/truyen-moi-cap-nhat',
+                            'https://truyenqqko.com/truyen-dang-hot',
+                            'https://truyenqqko.com/truyen-hoan-thanh'
+                        ];
+                        const htmlList = await Promise.allSettled(urls.map(u => fetchHTML(u)));
+                        const aggregated = [];
+                        for (const item of htmlList) {
+                            if (item.status === 'fulfilled' && item.value) {
+                                const p = truyenqq.parseListing(item.value, 1);
+                                if (p.stories) aggregated.push(...p.stories);
+                            }
+                        }
+
+                        const uniqueStories = Array.from(new Map(aggregated.map(s => [s.url, s])).values());
+                        const matched = uniqueStories.filter(s => {
+                            const normTitle = normalizeText(s.title);
+                            const normExcerpt = normalizeText(s.excerpt);
+                            return normTitle.includes(normQ) || normExcerpt.includes(normQ);
+                        });
+
+                        return {
+                            stories: matched,
+                            page: 1,
+                            totalPages: 1
+                        };
+                    } catch {
+                        return { stories: [], page: 1, totalPages: 1 };
+                    }
                 });
                 return jsonResponse(result);
             }
