@@ -74,6 +74,119 @@ function normalizeText(str) {
         .trim();
 }
 
+// ── Sitemap-based search index ──
+// TruyenQQ blocks /tim-kiem endpoint server-side (returns 0 bytes).
+// Instead, we build a search index from sitemaps (23k+ manga URLs).
+let sitemapIndex = null; // { entries: [{url, slug, titleFromSlug}], expiresAt }
+
+async function getSitemapIndex() {
+    if (sitemapIndex && sitemapIndex.expiresAt > Date.now()) {
+        return sitemapIndex.entries;
+    }
+
+    const sitemapUrls = [
+        'https://truyenqqko.com/sitemap-comic-1.xml',
+        'https://truyenqqko.com/sitemap-comic-2.xml',
+        'https://truyenqqko.com/sitemap-comic-3.xml',
+        'https://truyenqqko.com/sitemap-comic-new.xml'
+    ];
+
+    const entries = [];
+    const results = await Promise.allSettled(
+        sitemapUrls.map(u => fetch(u, {
+            headers: { 'User-Agent': DEFAULT_USER_AGENT }
+        }).then(r => r.text()))
+    );
+
+    for (const r of results) {
+        if (r.status !== 'fulfilled' || !r.value) continue;
+        const matches = r.value.matchAll(/<loc>(https:\/\/truyenqqko\.com\/truyen-tranh\/([^<]+))<\/loc>/g);
+        for (const m of matches) {
+            const url = m[1];
+            const slug = m[2]; // e.g. "one-piece-1-128"
+            // Remove trailing numeric ID: "one-piece-1-128" -> "one-piece"
+            // but keep meaningful numbers like "3077" in "thien-ma-3077-16100"
+            const titleFromSlug = slug
+                .replace(/-\d+$/, '')  // remove last numeric ID
+                .replace(/-/g, ' ');   // dashes to spaces
+            entries.push({ url, slug, titleFromSlug });
+        }
+    }
+
+    // Cache for 6 hours
+    sitemapIndex = { entries, expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
+    return entries;
+}
+
+async function searchBySitemap(query, page = 1) {
+    const entries = await getSitemapIndex();
+    const normQ = normalizeText(query);
+    const queryWords = normQ.split(/\s+/).filter(w => w.length > 0);
+
+    // Score each entry by how well its slug matches the query
+    const scored = [];
+    for (const entry of entries) {
+        const normSlug = normalizeText(entry.titleFromSlug);
+        // All query words must appear in slug
+        const allMatch = queryWords.every(w => normSlug.includes(w));
+        if (!allMatch) continue;
+
+        // Score: exact match > starts with > contains
+        let score = 0;
+        if (normSlug === normQ) score = 100;
+        else if (normSlug.startsWith(normQ)) score = 80;
+        else score = 50;
+        // Bonus: shorter slugs rank higher (more specific match)
+        score -= Math.min(normSlug.length, 30) * 0.5;
+
+        scored.push({ ...entry, score });
+    }
+
+    // Sort by score descending
+    scored.sort((a, b) => b.score - a.score);
+
+    // Paginate: 20 per page
+    const perPage = 20;
+    const totalPages = Math.max(1, Math.ceil(scored.length / perPage));
+    const pageItems = scored.slice((page - 1) * perPage, page * perPage);
+
+    if (pageItems.length === 0) {
+        return { stories: [], page, totalPages };
+    }
+
+    // Fetch story detail pages in parallel (max 10 at a time) to get covers/titles
+    const detailResults = await Promise.allSettled(
+        pageItems.map(item =>
+            fetchHTML(item.url).then(html => {
+                const details = truyenqq.parseStoryDetails(html);
+                return {
+                    sourceId: 'truyenqq',
+                    title: details.title || item.titleFromSlug,
+                    url: item.url,
+                    coverUrl: details.coverUrl || null,
+                    lastChapter: null,
+                    excerpt: details.description || null,
+                    kind: 'comic'
+                };
+            }).catch(() => ({
+                sourceId: 'truyenqq',
+                title: item.titleFromSlug.replace(/(^|\s)\S/g, c => c.toUpperCase()),
+                url: item.url,
+                coverUrl: null,
+                lastChapter: null,
+                excerpt: null,
+                kind: 'comic'
+            }))
+        )
+    );
+
+    const stories = detailResults
+        .filter(r => r.status === 'fulfilled')
+        .map(r => r.value);
+
+    return { stories, page, totalPages };
+}
+
 function jsonResponse(data, status = 200) {
     return new Response(JSON.stringify(data), {
         status,
@@ -180,51 +293,8 @@ export default {
 
                 const cacheKey = `truyenqq:search:${query.toLowerCase()}:${page}`;
                 const result = await cachedFetch(cacheKey, TTL.LISTING, async () => {
-                    const normQ = normalizeText(query);
-
-                    // Strategy 1: Try direct search endpoint
-                    try {
-                        const searchUrl = truyenqq.searchUrl(query, page);
-                        const html = await fetchHTML(searchUrl);
-                        const parsed = truyenqq.parseSearch(html, page);
-                        if (parsed.stories && parsed.stories.length > 0) {
-                            return parsed;
-                        }
-                    } catch (e) {
-                        // ignore and try fallback
-                    }
-
-                    // Strategy 2: Aggregate top listings (recent, hot, completed) and filter by keyword
-                    try {
-                        const urls = [
-                            'https://truyenqqko.com/truyen-moi-cap-nhat',
-                            'https://truyenqqko.com/truyen-dang-hot',
-                            'https://truyenqqko.com/truyen-hoan-thanh'
-                        ];
-                        const htmlList = await Promise.allSettled(urls.map(u => fetchHTML(u)));
-                        const aggregated = [];
-                        for (const item of htmlList) {
-                            if (item.status === 'fulfilled' && item.value) {
-                                const p = truyenqq.parseListing(item.value, 1);
-                                if (p.stories) aggregated.push(...p.stories);
-                            }
-                        }
-
-                        const uniqueStories = Array.from(new Map(aggregated.map(s => [s.url, s])).values());
-                        const matched = uniqueStories.filter(s => {
-                            const normTitle = normalizeText(s.title);
-                            const normExcerpt = normalizeText(s.excerpt);
-                            return normTitle.includes(normQ) || normExcerpt.includes(normQ);
-                        });
-
-                        return {
-                            stories: matched,
-                            page: 1,
-                            totalPages: 1
-                        };
-                    } catch {
-                        return { stories: [], page: 1, totalPages: 1 };
-                    }
+                    // Use sitemap-based search (covers all 23k+ manga on TruyenQQ)
+                    return await searchBySitemap(query, page);
                 });
                 return jsonResponse(result);
             }
